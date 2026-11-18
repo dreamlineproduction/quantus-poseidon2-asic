@@ -190,6 +190,7 @@ module quantus_miner_compact (
 
     wire [63:0] mult_out, int_lane_out;
     gl_mult_comb u_shared_mult (.a(mult_a), .b(mult_b), .out(mult_out));
+
     gl_add_comb  u_diag_add    (.a(total_sum), .b(mult_out), .out(int_lane_out));
 // 1 Shared External MDS block
 wire [767:0] mds_in = (round_idx == 6'd0) ? {704'd0, 48'd0, nonce_counter} : state_reg;
