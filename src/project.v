@@ -15,6 +15,7 @@ module gl_add_comb (
     assign out = (sum >= P) ? (sum - P) : sum[63:0];
 endmodule
 
+// Single Shared 64-bit Goldilocks Multiplier for the ENTIRE Chip!
 module gl_mult_comb (
     input  wire [63:0] a,
     input  wire [63:0] b,
@@ -33,20 +34,8 @@ module gl_mult_comb (
                  (reduced >= P) ? (reduced - P) : reduced[63:0];
 endmodule
 
-// Single Shared S-Box (4 multipliers total for the ENTIRE chip)
-module sbox_comb (
-    input  wire [63:0] x,
-    output wire [63:0] out
-);
-    wire [63:0] x2, x3, x4;
-    gl_mult_comb m1(x,  x,  x2);
-    gl_mult_comb m2(x2, x,  x3);
-    gl_mult_comb m3(x2, x2, x4);
-    gl_mult_comb m4(x3, x4, out);
-endmodule
-
 // ============================================================================
-// 2. External Linear Layer (Exact Quantus apply_mat4 + Outer Sum -> Adders Only)
+// 2. Shared External Linear Layer (Exact Quantus apply_mat4 + Outer Sum)
 // ============================================================================
 module poseidon2_mds_ext (
     input  wire [767:0] state_in,
@@ -105,7 +94,7 @@ module poseidon2_mds_ext (
 endmodule
 
 // ============================================================================
-// 3. Compact Quantus Poseidon2 Miner Core (Only 5 Multipliers Total)
+// 3. Single-Multiplier Quantus Poseidon2 Miner (Fits < 65% of 8x2 Chip!)
 // ============================================================================
 module quantus_miner_compact (
     input  wire         clk,
@@ -115,7 +104,6 @@ module quantus_miner_compact (
     output reg          golden_nonce_found,
     output reg  [15:0]  golden_nonce
 );
-    // Official Quantus Round Constants ROMs
     localparam [3071:0] EXT_INIT_ROM = {
         {64'hde795c20a2357af7, 64'h5b4e40ffc759532f, 64'h902cbd0956f655e3, 64'hcdb13f4cd93e024c, 64'he9da8d699b94184a, 64'haad3bea4baac9a5a, 64'h23eda6f3c99150dd, 64'h3ba588cacb43b5e0, 64'h63c8e72f542bf3fc, 64'haa284b3ecdb222ae, 64'h622462a1f9aaaeed, 64'h1e5e2b5760e32477},
         {64'hf51593e2beb5e3bd, 64'h5762bfe181f25047, 64'h4fd53e50ca04a7ee, 64'hee0b22d0dfae8bb8, 64'h64b0a186698e01d3, 64'h999a649b69b9d32f, 64'h265293b0e47ce88a, 64'h78f04462d48b1c98, 64'hdb14234eafaf5173, 64'hb35a8e976d2af617, 64'h89ae889caaf0802c, 64'h7d5c08eef608e382},
@@ -146,31 +134,30 @@ module quantus_miner_compact (
     };
 
     reg [767:0] state_reg;
-    reg [5:0]   round_idx; // 0 = Init, 1..30 = Rounds
-    reg [3:0]   lane_idx;  // 0..11 = Serial lane counter, 12 = Matrix Mix
+    reg [5:0]   round_idx; // 0 = Init MDS, 1..30 = Rounds
+    reg [3:0]   lane_idx;  // 0..11 = Lanes, 12 = Matrix Mix
+    reg [2:0]   sub_step;  // 0..3 = S-box multiplications (x^2, x^3, x^4, x^7), 4 = Diag mult
+    reg [63:0]  tmp_x2, tmp_x3;
     reg [15:0]  nonce_counter;
 
     wire is_ext_init = (round_idx >= 6'd1) && (round_idx <= 6'd4);
     wire is_int      = (round_idx >= 6'd5) && (round_idx <= 6'd26);
     wire is_ext_term = (round_idx >= 6'd27) && (round_idx <= 6'd30);
 
-    // Pre-compute ROM bit-offsets with explicit sized operands (Verilog-2005 safe)
     wire [11:0] ext_init_offset = (({6'd0, round_idx} - 12'd1) * 12'd12 + {8'd0, lane_idx}) * 12'd64;
     wire [11:0] ext_term_offset = (({6'd0, round_idx} - 12'd27) * 12'd12 + {8'd0, lane_idx}) * 12'd64;
     wire [11:0] int_offset      = ({6'd0, round_idx} - 12'd5) * 12'd64;
     wire [9:0]  lane_offset     = {6'd0, lane_idx} * 10'd64;
     wire [9:0]  prev_lane_off   = ({6'd0, lane_idx} - 10'd1) * 10'd64;
 
-    // Select current 64-bit lane and current 64-bit round constant
     wire [63:0] cur_lane = (lane_idx < 4'd12) ? state_reg[lane_offset +: 64] : 64'd0;
     wire [63:0] cur_rc   = is_ext_init                  ? EXT_INIT_ROM[ext_init_offset +: 64] :
                            (is_int && lane_idx == 4'd0) ? INT_ROM[int_offset +: 64] :
                            is_ext_term                  ? EXT_TERM_ROM[ext_term_offset +: 64] : 64'd0;
 
-    // 1 Shared Adder + 1 Shared S-Box (4 multipliers total)
-    wire [63:0] lane_plus_rc, lane_sboxed;
+    // 1 Shared Adder
+    wire [63:0] lane_plus_rc;
     gl_add_comb u_rc_add (.a(cur_lane), .b(cur_rc), .out(lane_plus_rc));
-    sbox_comb   u_sbox   (.x(lane_plus_rc), .out(lane_sboxed));
 
     // Sum all 12 lanes for Internal MDS
     wire [63:0] s0, s1, s2, s3, s4, s5, s6, s7, s8, s9, total_sum;
@@ -186,52 +173,75 @@ module quantus_miner_compact (
     gl_add_comb a9(s8,                 state_reg[703:640], s9);
     gl_add_comb a10(s9,                state_reg[767:704], total_sum);
 
-    // 1 Shared Diagonal Multiplier for Internal MDS (5th multiplier)
+    // 1 SINGLE SHARED 64-BIT MULTIPLIER FOR THE ENTIRE ASIC!
     wire [63:0] int_cur_lane = (lane_idx >= 4'd1 && lane_idx <= 4'd12) ? state_reg[prev_lane_off +: 64] : 64'd0;
     wire [63:0] cur_diag     = (lane_idx >= 4'd1 && lane_idx <= 4'd12) ? DIAG_PACKED[prev_lane_off +: 64] : 64'd0;
-    wire [63:0] diag_prod, int_lane_out;
-    gl_mult_comb u_diag_m (.a(int_cur_lane), .b(cur_diag), .out(diag_prod));
-    gl_add_comb  u_diag_a (.a(total_sum), .b(diag_prod), .out(int_lane_out));
 
-// External MDS block (adders only)
-wire [767:0] init_mds_out, ext_mds_out;
-poseidon2_mds_ext m_init (.state_in({704'd0, 48'd0, nonce_counter}), .state_out(init_mds_out));
-poseidon2_mds_ext m_ext  (.state_in(state_reg), .state_out(ext_mds_out));
+    reg [63:0] mult_a, mult_b;
+    always @(*) begin
+        case (sub_step)
+            3'd0: begin mult_a = lane_plus_rc; mult_b = lane_plus_rc; end // x^2
+            3'd1: begin mult_a = tmp_x2;       mult_b = lane_plus_rc; end // x^3
+            3'd2: begin mult_a = tmp_x2;       mult_b = tmp_x2;       end // x^4
+            3'd3: begin mult_a = tmp_x3;       mult_b = tmp_x2;       end // x^7 (tmp_x2 holds x^4)
+            default: begin mult_a = int_cur_lane; mult_b = cur_diag;  end // diag mult
+        endcase
+    end
+
+    wire [63:0] mult_out, int_lane_out;
+    gl_mult_comb u_shared_mult (.a(mult_a), .b(mult_b), .out(mult_out));
+    gl_add_comb  u_diag_add    (.a(total_sum), .b(mult_out), .out(int_lane_out));
+// 1 Shared External MDS block
+wire [767:0] mds_in = (round_idx == 6'd0) ? {704'd0, 48'd0, nonce_counter} : state_reg;
+wire [767:0] mds_out;
+poseidon2_mds_ext u_shared_mds (.state_in(mds_in), .state_out(mds_out));
 always @(posedge clk) begin
 if (reset) begin
 round_idx          <= 6'd0;
 lane_idx           <= 4'd0;
+sub_step           <= 3'd0;
+tmp_x2             <= 64'd0;
+tmp_x3             <= 64'd0;
 nonce_counter      <= 16'd0;
 state_reg          <= 768'd0;
 golden_nonce_found <= 1'b0;
 golden_nonce       <= 16'd0;
 end else if (mining_enable && !golden_nonce_found) begin
 if (round_idx == 6'd0) begin
-state_reg <= init_mds_out;
+state_reg <= mds_out;
 round_idx <= 6'd1;
 lane_idx  <= 4'd0;
-end else if (is_int) begin
-if (lane_idx == 4'd0) begin
-state_reg[63:0] <= lane_sboxed;
-lane_idx        <= 4'd1;
-end else if (lane_idx <= 4'd12) begin
+sub_step  <= 3'd0;
+end else if (is_int && lane_idx >= 4'd1) begin
+// Internal diagonal sweep (1 mult per lane)
 state_reg[prev_lane_off +: 64] <= int_lane_out;
 if (lane_idx == 4'd12) begin
 lane_idx  <= 4'd0;
+sub_step  <= 3'd0;
 round_idx <= round_idx + 6'd1;
 end else begin
 lane_idx <= lane_idx + 4'd1;
 end
-end
-end else begin
-if (lane_idx < 4'd12) begin
-state_reg[lane_offset +: 64] <= lane_sboxed;
+end else if (lane_idx < 4'd12 && (!is_int || lane_idx == 4'd0)) begin
+// 4-step micro-sequencer using the 1 shared multiplier for S-Box x^7
+case (sub_step)
+3'd0: begin tmp_x2 <= mult_out; sub_step <= 3'd1; end // saved x^2
+3'd1: begin tmp_x3 <= mult_out; sub_step <= 3'd2; end // saved x^3
+3'd2: begin tmp_x2 <= mult_out; sub_step <= 3'd3; end // saved x^4 into tmp_x2
+default: begin
+// Finished x^7!
+state_reg[lane_offset +: 64] <= mult_out;
+sub_step <= is_int ? 3'd4 : 3'd0;
 lane_idx <= lane_idx + 4'd1;
+end
+endcase
 end else begin
-state_reg <= ext_mds_out;
+// External round MDS finish
+state_reg <= mds_out;
 lane_idx  <= 4'd0;
+sub_step  <= 3'd0;
 if (round_idx == 6'd30) begin
-if (ext_mds_out[63:56] < target_top_byte) begin
+if (mds_out[63:56] < target_top_byte) begin
 golden_nonce_found <= 1'b1;
 golden_nonce       <= nonce_counter;
 end else begin
@@ -240,7 +250,6 @@ round_idx     <= 6'd0;
 end
 end else begin
 round_idx <= round_idx + 6'd1;
-end
 end
 end
 end
@@ -261,7 +270,7 @@ input  wire       rst_n
 );
 wire        golden_nonce_found;
 wire [15:0] golden_nonce;
-wire _unused = &{ena, uio_in, golden_nonce[15], 1'b0};
+wire _unused = &{ena, uio_in, golden_nonce, 1'b0};
 quantus_miner_compact quantus_core (
 .clk(clk),
 .reset(~rst_n),
