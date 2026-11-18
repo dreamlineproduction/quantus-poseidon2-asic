@@ -34,7 +34,7 @@ module gl_mult_comb (
                  (reduced >= P) ? (reduced - P) : reduced[63:0];
 endmodule
 
-// Single-cycle S-Box (x^7 mod P)
+// Single Shared S-Box (4 multipliers total for the ENTIRE chip!)
 module sbox_comb (
     input  wire [63:0] x,
     output wire [63:0] out
@@ -47,7 +47,7 @@ module sbox_comb (
 endmodule
 
 // ============================================================================
-// 2. External Linear Layer (Exact Quantus apply_mat4 + Outer Sum)
+// 2. External Linear Layer (Exact Quantus apply_mat4 + Outer Sum -> Adders Only!)
 // ============================================================================
 module poseidon2_mds_ext (
     input  wire [767:0] state_in,
@@ -106,53 +106,15 @@ module poseidon2_mds_ext (
 endmodule
 
 // ============================================================================
-// 3. Internal Linear Layer (Exact Quantus MATRIX_DIAG)
+// 3. Compact Quantus Poseidon2 Miner Core (Only 5 Multipliers Total!)
 // ============================================================================
-module poseidon2_mds_int (
-    input  wire [767:0] state_in,
-    output wire [767:0] state_out
-);
-    localparam [767:0] DIAG_PACKED = {
-        64'hd27dbb6944917b60, 64'h0c6388b51545e883, 64'hf3faac6faee378ae, 64'ha2077d7dfbb606b5,
-        64'hac45e25b7127b68b, 64'h5528b9362c59bb70, 64'h6743bc47b9595257, 64'h5daf18bbd996604b,
-        64'h7964f570e7188037, 64'h0d0c371c5b35b84f, 64'hd84b5de94a324fb6, 64'hc3b6c08e23ba9300
-    };
-
-    wire [63:0] s0, s1, s2, s3, s4, s5, s6, s7, s8, s9, total_sum;
-    gl_add_comb a0(state_in[63:0],    state_in[127:64],  s0);
-    gl_add_comb a1(s0,                state_in[191:128], s1);
-    gl_add_comb a2(s1,                state_in[255:192], s2);
-    gl_add_comb a3(s2,                state_in[319:256], s3);
-    gl_add_comb a4(s3,                state_in[383:320], s4);
-    gl_add_comb a5(s4,                state_in[447:384], s5);
-    gl_add_comb a6(s5,                state_in[511:448], s6);
-    gl_add_comb a7(s6,                state_in[575:512], s7);
-    gl_add_comb a8(s7,                state_in[639:576], s8);
-    gl_add_comb a9(s8,                state_in[703:640], s9);
-    gl_add_comb a10(s9,               state_in[767:704], total_sum);
-
-    genvar i;
-    generate
-        for (i = 0; i < 12; i = i + 1) begin : diag_lanes
-            wire [63:0] prod;
-            gl_mult_comb m_d (.a(state_in[i*64 +: 64]), .b(DIAG_PACKED[i*64 +: 64]), .out(prod));
-            gl_add_comb  a_d (.a(total_sum), .b(prod), .out(state_out[i*64 +: 64]));
-        end
-    endgenerate
-endmodule
-
-// ============================================================================
-// 4. Complete Autonomous Quantus ASIC Miner (Iterative 30-Clock Engine!)
-// ============================================================================
-module quantus_miner_asic (
+module quantus_miner_compact (
     input  wire         clk,
     input  wire         reset,
     input  wire         mining_enable,
-    input  wire [767:0] midstate_in,
-    input  wire [255:0] target_difficulty,
+    input  wire [7:0]   target_top_byte,
     output reg          golden_nonce_found,
-    output reg  [63:0]  golden_nonce,
-    output reg  [255:0] golden_hash
+    output reg  [15:0]  golden_nonce
 );
     // Official Quantus Round Constants ROMs
     localparam [3071:0] EXT_INIT_ROM = {
@@ -178,56 +140,99 @@ module quantus_miner_asic (
         {64'h6673e505cfd0b6ba, 64'h1cbb36f11127338b, 64'h0ed0d75c27975d97, 64'h64ddb9d5de7e00a6, 64'hb0464d9d77b97fca, 64'h34f7909ae5258d64, 64'hf6e7e38b1ea6ba2f, 64'ha205d0ffa9b9def3, 64'h6d36c5022c4fe7c2, 64'h802028b68f35fc88, 64'h144573dae2ce9976, 64'h7b72c539e0ea4c6e}
     };
 
-    reg [767:0] state_reg;
-    reg [5:0]   round_idx; // 0 = Init MDS, 1..30 = Poseidon2 Rounds
-    reg [63:0]  nonce_counter;
+    localparam [767:0] DIAG_PACKED = {
+        64'hd27dbb6944917b60, 64'h0c6388b51545e883, 64'hf3faac6faee378ae, 64'ha2077d7dfbb606b5,
+        64'hac45e25b7127b68b, 64'h5528b9362c59bb70, 64'h6743bc47b9595257, 64'h5daf18bbd996604b,
+        64'h7964f570e7188037, 64'h0d0c371c5b35b84f, 64'hd84b5de94a324fb6, 64'hc3b6c08e23ba9300
+    };
 
-    // Select active round constant based on round_idx (1..30)
+    reg [767:0] state_reg;
+    reg [5:0]   round_idx; // 0 = Init, 1..30 = Rounds
+    reg [3:0]   lane_idx;  // 0..11 = Serial lane counter, 12 = Matrix Mix!
+    reg [15:0]  nonce_counter;
+
     wire is_ext_init = (round_idx >= 6'd1) && (round_idx <= 6'd4);
     wire is_int      = (round_idx >= 6'd5) && (round_idx <= 6'd26);
     wire is_ext_term = (round_idx >= 6'd27) && (round_idx <= 6'd30);
 
-    wire [767:0] active_rc = is_ext_init ? EXT_INIT_ROM[(round_idx - 6'd1)*768 +: 768] :
-                             is_int      ? {704'd0, INT_ROM[(round_idx - 6'd5)*64 +: 64]} :
-                             is_ext_term ? EXT_TERM_ROM[(round_idx - 6'd27)*768 +: 768] : 768'd0;
+    // Select current 64-bit lane and current 64-bit round constant
+    wire [63:0] cur_lane = state_reg[lane_idx*64 +: 64];
+    wire [63:0] cur_rc   = is_ext_init ? EXT_INIT_ROM[((round_idx - 6'd1)*12 + lane_idx)*64 +: 64] :
+                           (is_int && lane_idx == 4'd0) ? INT_ROM[(round_idx - 6'd5)*64 +: 64] :
+                           is_ext_term ? EXT_TERM_ROM[((round_idx - 6'd27)*12 + lane_idx)*64 +: 64] : 64'd0;
 
-    // Add Round Constants & Apply S-Box (12 S-boxes for external, 1 S-box for internal)
-    wire [767:0] after_rc, after_sbox;
-    genvar i;
-    generate
-        for (i = 0; i < 12; i = i + 1) begin : round_lanes
-            gl_add_comb rc_add (.a(state_reg[i*64 +: 64]), .b(active_rc[i*64 +: 64]), .out(after_rc[i*64 +: 64]));
-            wire [63:0] sbox_val;
-            sbox_comb sb (.x(after_rc[i*64 +: 64]), .out(sbox_val));
-            // For internal rounds, only Lane 0 uses S-box; Lanes 1..11 bypass!
-            assign after_sbox[i*64 +: 64] = (i == 0 || !is_int) ? sbox_val : state_reg[i*64 +: 64];
-        end
-    endgenerate
+    // 1 Shared Adder + 1 Shared S-Box (4 multipliers total!)
+    wire [63:0] lane_plus_rc, lane_sboxed;
+    gl_add_comb u_rc_add (.a(cur_lane), .b(cur_rc), .out(lane_plus_rc));
+    sbox_comb   u_sbox   (.x(lane_plus_rc), .out(lane_sboxed));
 
-    wire [767:0] mds_ext_out, mds_int_out, init_mds_out;
-poseidon2_mds_ext m_init (.state_in({midstate_in[767:64], midstate_in[63:0] ^ nonce_counter}), .state_out(init_mds_out));
-poseidon2_mds_ext m_ext  (.state_in(after_sbox), .state_out(mds_ext_out));
-poseidon2_mds_int m_int  (.state_in(after_sbox), .state_out(mds_int_out));
-wire [767:0] next_state = (round_idx == 6'd0) ? init_mds_out :
-is_int              ? mds_int_out  : mds_ext_out;
-always @(posedge clk) begin
-if (reset) begin
-round_idx          <= 6'd0;
-nonce_counter      <= 64'd0;
-state_reg          <= 768'd0;
-golden_nonce_found <= 1'b0;
-golden_nonce       <= 64'd0;
-golden_hash        <= 256'd0;
-end else if (mining_enable && !golden_nonce_found) begin
-state_reg <= next_state;
+    // Sum all 12 lanes for Internal MDS
+    wire [63:0] s0, s1, s2, s3, s4, s5, s6, s7, s8, s9, total_sum;
+    gl_add_comb a0(state_reg[63:0],    state_reg[127:64],  s0);
+    gl_add_comb a1(s0,                 state_reg[191:128], s1);
+    gl_add_comb a2(s1,                 state_reg[255:192], s2);
+    gl_add_comb a3(s2,                 state_reg[319:256], s3);
+    gl_add_comb a4(s3,                 state_reg[383:320], s4);
+    gl_add_comb a5(s4,                 state_reg[447:384], s5);
+    gl_add_comb a6(s5,                 state_reg[511:448], s6);
+    gl_add_comb a7(s6,                 state_reg[575:512], s7);
+    gl_add_comb a8(s7,                 state_reg[639:576], s8);
+    gl_add_comb a9(s8,                 state_reg[703:640], s9);
+    gl_add_comb a10(s9,                state_reg[767:704], total_sum);
+
+    // 1 Shared Diagonal Multiplier for Internal MDS (5th multiplier!)
+    wire [63:0] cur_diag = DIAG_PACKED[lane_idx*64 +: 64];
+    wire [63:0] diag_prod, int_lane_out;
+    gl_mult_comb u_diag_m (.a(cur_lane), .b(cur_diag), .out(diag_prod));
+    gl_add_comb  u_diag_a (.a(total_sum), .b(diag_prod), .out(int_lane_out));
+
+    // External MDS block (adders only)
+    wire [767:0] init_mds_out, ext_mds_out;
+    poseidon2_mds_ext m_init (.state_in({704'd0, 48'd0, nonce_counter}), .state_out(init_mds_out));
+    poseidon2_mds_ext m_ext  (.state_in(state_reg), .state_out(ext_mds_out));
+
+    always @(posedge clk) begin
+        if (reset) begin
+            round_idx          <= 6'd0;
+            lane_idx           <= 4'd0;
+            nonce_counter      <= 16'd0;
+            state_reg          <= 768'd0;
+            golden_nonce_found <= 1'b0;
+            golden_nonce       <= 16'd0;
+        end else if (mining_enable && !golden_nonce_found) begin
+            if (round_idx == 6'd0) begin
+state_reg <= init_mds_out;
+round_idx <= 6'd1;
+lane_idx  <= 4'd0;
+end else if (is_int) begin
+// Internal round: 1 cycle for Lane 0 S-box, then 12 cycles for diagonal mix
+if (lane_idx == 4'd0 && state_reg[767:760] != 8'hFF) begin
+// Apply S-box to Lane 0 first, then sweep lanes 0..11 for diag mix
+state_reg[63:0] <= lane_sboxed;
+lane_idx        <= 4'd1;
+end else if (lane_idx <= 4'd12) begin
+state_reg[(lane_idx - 4'd1)64 +: 64] <= int_lane_out;
+if (lane_idx == 4'd12) begin
+lane_idx  <= 4'd0;
+round_idx <= round_idx + 6'd1;
+end else begin
+lane_idx <= lane_idx + 4'd1;
+end
+end
+end else begin
+// External round: sweep lanes 0..11 through shared S-box, then apply MDS
+if (lane_idx < 4'd12) begin
+state_reg[lane_idx64 +: 64] <= lane_sboxed;
+lane_idx <= lane_idx + 4'd1;
+end else begin
+state_reg <= ext_mds_out;
+lane_idx  <= 4'd0;
 if (round_idx == 6'd30) begin
-// Hash finished! Check difficulty target!
-if (next_state[255:0] < target_difficulty) begin
+if (ext_mds_out[63:56] < target_top_byte) begin
 golden_nonce_found <= 1'b1;
 golden_nonce       <= nonce_counter;
-golden_hash        <= next_state[255:0];
 end else begin
-nonce_counter <= nonce_counter + 64'd1;
+nonce_counter <= nonce_counter + 16'd1;
 round_idx     <= 6'd0;
 end
 end else begin
@@ -235,41 +240,34 @@ round_idx <= round_idx + 6'd1;
 end
 end
 end
+end
+end
 endmodule
 // ============================================================================
-// Tiny Tapeout 24-Pin Physical Chip Wrapper
+// 4. Tiny Tapeout 24-Pin Physical Chip Wrapper
 // ============================================================================
 module tt_um_example (
-    input  wire [7:0] ui_in,    // 8 Dedicated Inputs (Target difficulty byte)
-    output wire [7:0] uo_out,   // 8 Dedicated Outputs (Winning nonce byte + alarm)
-    input  wire [7:0] uio_in,   // 8 Bidirectional Inputs
-    output wire [7:0] uio_out,  // 8 Bidirectional Outputs
-    output wire [7:0] uio_oe,   // Bidirectional Enable (0 = input, 1 = output)
-    input  wire       ena,      // Chip Enable (1 when active)
-    input  wire       clk,      // System Clock
-    input  wire       rst_n     // Active-Low Reset (0 = reset, 1 = run)
+input  wire [7:0] ui_in,
+output wire [7:0] uo_out,
+input  wire [7:0] uio_in,
+output wire [7:0] uio_out,
+output wire [7:0] uio_oe,
+input  wire       ena,
+input  wire       clk,
+input  wire       rst_n
 );
-    wire         golden_nonce_found;
-    wire [63:0]  golden_nonce;
-    wire [255:0] golden_hash;
-
-    // Prevent unused input warnings during ASIC synthesis
-    wire _unused = &{ena, uio_in, golden_nonce[63:15], golden_hash, 1'b0};
-
-    // Connect your Quantus ASIC to the physical chip pins!
-    quantus_miner_asic quantus_core (
-        .clk(clk),
-        .reset(~rst_n),
-        .mining_enable(ena),
-        .midstate_in(768'd0),
-        .target_difficulty({ui_in, 248'hFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF}),
-        .golden_nonce_found(golden_nonce_found),
-        .golden_nonce(golden_nonce),
-        .golden_hash(golden_hash)
-    );
-
-    // Send status & winning nonce bytes out to the physical chip pins!
-    assign uo_out  = {golden_nonce_found, golden_nonce[6:0]};
-    assign uio_out = golden_nonce[14:7];
-    assign uio_oe  = 8'hFF;
+wire        golden_nonce_found;
+wire [15:0] golden_nonce;
+wire _unused = &{ena, uio_in, 1'b0};
+quantus_miner_compact quantus_core (
+.clk(clk),
+.reset(~rst_n),
+.mining_enable(ena),
+.target_top_byte(ui_in),
+.golden_nonce_found(golden_nonce_found),
+.golden_nonce(golden_nonce)
+);
+assign uo_out  = {golden_nonce_found, golden_nonce[6:0]};
+assign uio_out = golden_nonce[14:7];
+assign uio_oe  = 8'hFF;
 endmodule
